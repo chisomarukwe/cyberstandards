@@ -1,140 +1,183 @@
 from flask import Flask, request, jsonify, render_template
 import pandas as pd
 import os
+import re
 
 app = Flask(__name__)
 
-# Define the path to your single, multi-sheet Excel file
-# Make sure your Excel file (e.g., "Cybersecurity Standards Database.xlsx")
-# is placed inside the 'static/data/' directory.
-EXCEL_FILE_NAME = "Cybersecurity Standards Database.xlsx" # <--- IMPORTANT: Match your actual Excel file name
+# --- Configuration for Data Files ---
+EXCEL_FILE_NAME = "Cybersecurity Standards Database..xltx"
 EXCEL_FILE_PATH = os.path.join("static", "data", EXCEL_FILE_NAME)
 
+# Custom sorting key for mixed numeric/dot strings (e.g., '1', '4.1', '4.1.1')
+def natural_sort_key(s):
+    # Split the string by dots and convert numeric parts to integers for comparison
+    return [int(text) if text.isdigit() else text for text in re.split('([0-9]+)', s)]
 
 # Load and clean standards data from a multi-sheet Excel file
 def load_clean_standards():
     all_data = []
-    all_sections = set()
+    all_sections_raw = set()  # Temporary set to collect all section values before strict filtering
     all_sources = set()
 
-    # Ensure the Excel file exists
-    if not os.path.exists(EXCEL_FILE_PATH):
-        print(f"[ERROR] Excel file not found at: {EXCEL_FILE_PATH}. Please ensure your Excel file is in place.")
-        # Return an empty DataFrame and lists if file not found
-        return pd.DataFrame(columns=['Section', 'Source', 'Description', 'Keywords', 'ControlID', 'Title', 'Page Number', 'Requirement Text', 'Simplified Summary', 'Control Category']), [], []
+    # --- Excel Loading Logic ---
+    if os.path.exists(EXCEL_FILE_PATH):
+        print(f"[INFO] Loading data from Excel file: {EXCEL_FILE_PATH}...")
+        try:
+            excel_file = pd.ExcelFile(EXCEL_FILE_PATH)
+            print(f"[INFO] Discovered sheets: {excel_file.sheet_names}")
 
-    try:
-        # Load the Excel file
-        excel_file = pd.ExcelFile(EXCEL_FILE_PATH)
-        print(f"[INFO] Found Excel file: {EXCEL_FILE_PATH}. Loading data from sheets...")
-        print(f"[INFO] Discovered sheets: {excel_file.sheet_names}")
+            expected_excel_cols = [
+                'Section', 'Sub-Section', 'Keywords', 'ControlID', 'Title',
+                'Page Number', 'Requirement Text', 'Simplified Summary',
+                'Control Category', 'Internal Control ID', 'Notes', 'Mapped',
+                'Foundation Requirements', 'System Requirements', 'Requirement Text.1', 'Simplified Summary.1'
+            ]
 
-        # Iterate through each sheet in the Excel file
-        for sheet_name in excel_file.sheet_names:
-            try:
-                # Read each sheet into a DataFrame
-                df = excel_file.parse(sheet_name)
+            for sheet_name in excel_file.sheet_names:
+                # Skip the 'Example' sheet as requested
+                if sheet_name.strip().lower() == 'example':
+                    print(f"[INFO] Skipping sheet: '{sheet_name}'")
+                    continue
 
-                # Clean column names by stripping whitespace
-                df.columns = df.columns.str.strip()
-                print(f"[DEBUG] Columns in sheet '{sheet_name}': {list(df.columns)}") # Log columns for debugging
-
-                # Convert relevant columns to string type to prevent .str accessor errors
-                # and fill NaN values with empty strings before stripping
-                columns_to_process = [
-                    'Section', 'Description', 'Keywords', 'ControlID', 'Title',
-                    'Page Number', 'Requirement Text', 'Simplified Summary',
-                    'Control Category', 'Internal Control ID' # Added Internal Control ID here as it's used
-                ]
-                for col in columns_to_process:
-                    if col in df.columns:
-                        # Convert column to string, filling NaN values with an empty string
-                        df[col] = df[col].fillna('').astype(str)
-
-                # The sheet name will be the source for all entries in this sheet
-                source = sheet_name.strip()
-                # Standardize source names if needed, e.g., 'IEC 62433-3' to 'IEC 62443-3-3'
-                if source == 'IEC 62433-3': # If your sheet name has this specific variant
-                    source = 'IEC 62443-3-3' # Standardize to the common name
-
-                # Iterate through rows and extract data
-                for _, row in df.iterrows():
-                    # Prioritize 'Section', then 'Control Category' if 'Section' is missing
-                    # These are already converted to string and NaN-filled above
-                    section_val = row.get('Section', '').strip()
-                    if not section_val: # If 'Section' is empty, try 'Control Category'
-                        section_val = row.get('Control Category', '').strip()
-                    
-                    # Filter out 'nan' strings from sections
-                    if section_val.lower() == 'nan':
-                        section_val = '' # Treat 'nan' as empty for filtering purposes
-
-                    # Prioritize 'Description', then 'Requirement Text', then 'Simplified Summary' for the main description
-                    # These are already converted to string and NaN-filled above
-                    description_val = row.get('Description', '').strip()
-                    if not description_val:
-                        description_val = row.get('Requirement Text', '').strip()
-                    if not description_val:
-                        description_val = row.get('Simplified Summary', '').strip()
-                    
-                    # Ensure we have at least a non-empty section and a description before adding
-                    if not section_val or not description_val:
-                        # print(f"[DEBUG] Skipping row due to missing Section or Description in sheet '{sheet_name}'. Section: '{section_val}', Description: '{description_val}'")
+                try:
+                    df = excel_file.parse(sheet_name)
+                    if df.empty:
+                        print(f"[WARNING] Sheet '{sheet_name}' is empty or could not be parsed. Skipping.")
                         continue
 
-                    # Extract all other fields - already converted to string and NaN-filled above
-                    keywords_val = row.get('Keywords', '').strip()
-                    control_id_val = row.get('ControlID', row.get('Internal Control ID', 'N/A')).strip() # Check for ControlID or Internal Control ID
-                    title_val = row.get('Title', '').strip()
-                    page_number_val = row.get('Page Number', '').strip()
-                    requirement_text_val = row.get('Requirement Text', '').strip()
-                    simplified_summary_val = row.get('Simplified Summary', '').strip()
-                    control_category_val = row.get('Control Category', '').strip() # Store separately, even if used for section fallback
+                    # Clean column names first, including removing _x000D_
+                    df.columns = [str(col).strip().replace('_x000D_', '') for col in df.columns]
+                    print(f"[DEBUG] Columns in sheet '{sheet_name}': {list(df.columns)}")
 
-                    all_data.append({
-                        'Section': section_val,
-                        'Source': source, # Source is now the sheet name
-                        'Description': description_val, # Main description field
-                        'Keywords': keywords_val,
-                        'ControlID': control_id_val,
-                        'Title': title_val,
-                        'Page Number': page_number_val,
-                        'Requirement Text': requirement_text_val, # Additional field
-                        'Simplified Summary': simplified_summary_val, # Additional field
-                        'Control Category': control_category_val # Additional field
-                    })
-                    # Add to sets for filter options, only if not empty
-                    if section_val: # Only add non-empty sections to the set
-                        all_sections.add(section_val)
-                    if source: # Only add non-empty sources to the set
-                        all_sources.add(source)
+                    for col in expected_excel_cols:
+                        if col not in df.columns:
+                            df[col] = ''
+                        else:
+                            # Fill NaN values with empty string and convert entire column to string type
+                            # Also remove _x000D_ from the content of these columns
+                            df[col] = df[col].fillna('').astype(str).str.replace('_x000D_', '').str.strip()
 
-            except Exception as e:
-                print(f"[ERROR] Error processing sheet '{sheet_name}' in '{EXCEL_FILE_NAME}': {e}")
-                # Print columns of the problematic sheet for debugging
-                if 'df' in locals(): # Check if df was created before error
-                    print(f"[DEBUG] Columns in problematic sheet '{sheet_name}': {list(df.columns)}")
-                continue # Continue to next sheet even if one fails
+                    source = sheet_name.strip()
+                    if source == 'IEC 62433-3':
+                        source = 'IEC 62443-3-3'
+                    source = source.strip()
 
-    except Exception as e:
-        print(f"[CRITICAL] Failed to load Excel file '{EXCEL_FILE_PATH}': {e}")
-        # If the entire Excel file fails to load, return empty data
-        return pd.DataFrame(columns=['Section', 'Source', 'Description', 'Keywords', 'ControlID', 'Title', 'Page Number', 'Requirement Text', 'Simplified Summary', 'Control Category']), [], []
+                    for _, row in df.iterrows():
+                        section_val = row.get('Sub-Section', '').strip()
+                        if not section_val:
+                            section_val = row.get('Section', '').strip()
+                        if not section_val:
+                            section_val = row.get('Control Category', '').strip()
+                        if section_val.lower() == 'nan':
+                            section_val = ''
 
+                        main_description_val = row.get('Requirement Text', '').strip()
+                        if not main_description_val:
+                            main_description_val = row.get('Simplified Summary', '').strip()
+                        if main_description_val.lower() == 'nan':
+                            main_description_val = ''
 
-    # Convert to DataFrame and remove duplicates
+                        keywords_val = row.get('Keywords', '').strip()
+                        if keywords_val.lower() == 'nan':
+                            keywords_val = ''
+
+                        control_id_val = row.get('ControlID', '').strip()
+                        if not control_id_val or control_id_val.lower() == 'nan':
+                            control_id_val = row.get('Internal Control ID', 'N/A').strip()
+                        if control_id_val.lower() == 'nan':
+                            control_id_val = 'N/A'
+
+                        title_val = row.get('Title', '').strip()
+                        if title_val.lower() == 'nan':
+                            title_val = ''
+
+                        page_number_val = row.get('Page Number', '').strip()
+                        if page_number_val.lower() == 'nan':
+                            page_number_val = ''
+
+                        requirement_text_val = row.get('Requirement Text', '').strip()
+                        if requirement_text_val.lower() == 'nan':
+                            requirement_text_val = ''
+                        if not requirement_text_val and 'Requirement Text.1' in row and row.get('Requirement Text.1', '').strip():
+                            requirement_text_val = row.get('Requirement Text.1', '').strip()
+                            if requirement_text_val.lower() == 'nan':
+                                requirement_text_val = ''
+
+                        simplified_summary_val = row.get('Simplified Summary', '').strip()
+                        if simplified_summary_val.lower() == 'nan':
+                            simplified_summary_val = ''
+                        if not simplified_summary_val and 'Simplified Summary.1' in row and row.get('Simplified Summary.1', '').strip():
+                            simplified_summary_val = row.get('Simplified Summary.1', '').strip()
+                            if simplified_summary_val.lower() == 'nan':
+                                simplified_summary_val = ''
+
+                        control_category_val = row.get('Control Category', '').strip()
+                        if control_category_val.lower() == 'nan':
+                            control_category_val = ''
+
+                        if not section_val and not main_description_val:
+                            continue
+
+                        all_data.append({
+                            'Section': section_val,
+                            'Source': source,
+                            'Description': main_description_val,
+                            'Keywords': keywords_val,
+                            'ControlID': control_id_val,
+                            'Title': title_val,
+                            'Page Number': page_number_val,
+                            'Requirement Text': requirement_text_val,
+                            'Simplified Summary': simplified_summary_val,
+                            'Control Category': control_category_val
+                        })
+
+                        if section_val:
+                            all_sections_raw.add(section_val)
+                        if source:
+                            all_sources.add(source)
+
+                except Exception as e:
+                    print(f"[ERROR] Error processing sheet '{sheet_name}' in '{EXCEL_FILE_NAME}': {e}")
+                    if 'df' in locals() and df is not None:
+                        if not df.empty:
+                            print(f"[DEBUG] Columns in problematic sheet '{sheet_name}': {list(df.columns)}")
+                        else:
+                            print(f"[DEBUG] DataFrame for sheet '{sheet_name}' was empty after parsing or during processing.")
+                    else:
+                        print(f"[DEBUG] DataFrame for sheet '{sheet_name}' was not initialized or accessible.")
+                    continue
+
+        except Exception as e:
+            print(f"[CRITICAL] Failed to load Excel file '{EXCEL_FILE_PATH}': {e}")
+    # --- End Excel Loading Logic ---
+
+    # --- Post-processing for sections and duplicates ---
+    final_sections = set()
+    for sec in all_sections_raw:
+        if re.fullmatch(r'[\d.]+', sec):
+            final_sections.add(sec)
+        else:
+            print(f"[DEBUG] Filtering out non-numeric section: '{sec}'")
+
     if all_data:
         df_final = pd.DataFrame(all_data)
-        # Drop duplicates based on a combination of identifying fields
-        df_final.drop_duplicates(subset=['Section', 'Source', 'Description', 'ControlID'], inplace=True)
+        if 'Description' not in df_final.columns:
+            df_final['Description'] = df_final['Requirement Text'].fillna('')
+
+        df_final.drop_duplicates(subset=[
+            'Source', 'ControlID', 'Requirement Text', 'Simplified Summary', 'Title'
+        ], inplace=True)
     else:
         df_final = pd.DataFrame(columns=['Section', 'Source', 'Description', 'Keywords', 'ControlID', 'Title', 'Page Number', 'Requirement Text', 'Simplified Summary', 'Control Category'])
+        df_final['Description'] = ''
 
     print(f"[INFO] Successfully loaded {len(df_final)} unique rows from Excel file.")
-    print(f"[INFO] Discovered Sections: {sorted(list(all_sections))}")
+    # Sort sections using the natural_sort_key
+    sorted_sections = sorted(list(final_sections), key=natural_sort_key)
+    print(f"[INFO] Discovered Sections (filtered and sorted): {sorted_sections}")
     print(f"[INFO] Discovered Sources: {sorted(list(all_sources))}")
-    return df_final, sorted(list(all_sections)), sorted(list(all_sources))
-
+    return df_final, sorted_sections, sorted(list(all_sources))
 
 # Load data once at startup
 try:
@@ -162,16 +205,16 @@ def search_standards():
 
     try:
         if query:
-            # Search across Description, Keywords, ControlID, Title, Requirement Text, Simplified Summary, Control Category
-            filtered = filtered[
-                filtered['Description'].str.contains(query, case=False, na=False) |
-                filtered['Keywords'].str.contains(query, case=False, na=False) |
-                filtered['ControlID'].str.contains(query, case=False, na=False) |
-                filtered['Title'].str.contains(query, case=False, na=False) |
-                filtered['Requirement Text'].str.contains(query, case=False, na=False) |
-                filtered['Simplified Summary'].str.contains(query, case=False, na=False) |
-                filtered['Control Category'].str.contains(query, case=False, na=False)
+            search_cols = [
+                'Description', 'Keywords', 'ControlID', 'Title',
+                'Requirement Text', 'Simplified Summary', 'Control Category', 'Section'
             ]
+
+            query_mask = pd.Series([False] * len(filtered), index=filtered.index)
+            for col in search_cols:
+                if col in filtered.columns:
+                    query_mask = query_mask | filtered[col].astype(str).str.contains(query, case=False, na=False)
+            filtered = filtered[query_mask]
 
         if section and section != "All Sections":
             if 'Section' in filtered.columns:
@@ -187,16 +230,16 @@ def search_standards():
 
         print(f"[DEBUG] Returning {len(filtered)} results for query='{query}', section='{section}', source='{source}'")
         return jsonify(filtered.to_dict(orient="records"))
-        
+
     except KeyError as ke:
-        print(f"[ERROR] Column not found in DataFrame during search: {ke}")
+        print(f"[ERROR] Column not found in DataFrame during search: {ke}. This should ideally not happen with current data loading.")
         return jsonify([]), 500
 
 
 @app.route("/api/filters", methods=["GET"])
 def get_filters():
     return jsonify({
-        "sections": all_sections,
+        "sections": all_sections,  # This will now contain only numeric values and be sorted
         "sources": all_sources
     })
 
@@ -208,5 +251,5 @@ def internal_error(error):
 
 
 if __name__ == "__main__":
-    print(f"[INFO] Starting Flask app. Data directory: {os.path.dirname(EXCEL_FILE_PATH)}") # Indicate the directory for clarity
+    print(f"[INFO] Starting Flask app. Data directory: {os.path.dirname(EXCEL_FILE_PATH)}")
     app.run(debug=True)
